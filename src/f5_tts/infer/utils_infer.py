@@ -218,12 +218,17 @@ def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
             if key in checkpoint["model_state_dict"]:
                 del checkpoint["model_state_dict"][key]
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     else:
         if ckpt_type == "safetensors":
             checkpoint = {"model_state_dict": checkpoint}
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
+    # 确保所有参数都是同一 dtype（修复新增参数的类型不匹配问题）
+    # 如果 checkpoint 中没有新参数（如 emphasis_mlp），它们会保持创建时的 dtype
+    # 需要统一转换为模型的 dtype
+    model = model.to(dtype)
+    
     del checkpoint
     torch.cuda.empty_cache()
 
@@ -401,9 +406,9 @@ def infer_process(
     audio, sr = torchaudio.load(ref_audio)
     max_chars = int(len(ref_text.encode("utf-8")) / (audio.shape[-1] / sr) * (22 - audio.shape[-1] / sr) * speed)
     gen_text_batches = chunk_text(gen_text, max_chars=max_chars)
-    for i, gen_text in enumerate(gen_text_batches):
-        print(f"gen_text {i}", gen_text)
-    print("\n")
+    # for i, gen_text in enumerate(gen_text_batches):
+    #     print(f"gen_text {i}", gen_text)
+    # print("\n")
 
     show_info(f"Generating audio in {len(gen_text_batches)} batches...")
     return next(
@@ -453,9 +458,10 @@ def infer_batch_process(
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
 
-    rms = torch.sqrt(torch.mean(torch.square(audio)))
-    if rms < target_rms:
-        audio = audio * target_rms / rms
+    # 移除 RMS 归一化，与训练时保持一致
+    # rms = torch.sqrt(torch.mean(torch.square(audio)))
+    # if rms < target_rms:
+    #     audio = audio * target_rms / rms
     if sr != target_sample_rate:
         resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
         audio = resampler(audio)
@@ -473,8 +479,14 @@ def infer_batch_process(
             local_speed = 0.3
 
         # Prepare the text
-        text_list = [ref_text + gen_text]
-        final_text_list = convert_char_to_pinyin(text_list)
+        text_list = [ref_text + ' ' + gen_text]
+        # Generate emphasis ids and remove <strong> and </strong> tags
+        final_text_list, emphasis_ids_list = convert_char_to_pinyin(
+            text_list, 
+            return_emphasis_ids=True
+        )
+
+
 
         ref_audio_len = audio.shape[-1] // hop_length
         if fix_duration is not None:
@@ -494,6 +506,7 @@ def infer_batch_process(
                 steps=nfe_step,
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
+                emphasis_ids=emphasis_ids_list,
             )
             del _
 
@@ -504,8 +517,9 @@ def infer_batch_process(
                 generated_wave = vocoder.decode(generated)
             elif mel_spec_type == "bigvgan":
                 generated_wave = vocoder(generated)
-            if rms < target_rms:
-                generated_wave = generated_wave * rms / target_rms
+            # 移除生成音频的 RMS 后处理，与训练时保持一致
+            # if rms < target_rms:
+            #     generated_wave = generated_wave * rms / target_rms
 
             # wav -> numpy
             generated_wave = generated_wave.squeeze().cpu().numpy()

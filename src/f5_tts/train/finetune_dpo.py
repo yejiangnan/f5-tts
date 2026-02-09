@@ -6,8 +6,8 @@ from importlib.resources import files
 
 from cached_path import cached_path
 
-from f5_tts.model import CFM, DiT, Trainer, UNetT
-from f5_tts.model.dataset import load_dataset
+from f5_tts.model import CFM, DiT, Trainer, UNetT, DPOTrainer
+from f5_tts.model.dataset import load_dataset, DPODataset
 from f5_tts.model.utils import get_tokenizer
 
 
@@ -78,6 +78,24 @@ def parse_args():
         type=str,
         help="The name of the saved checkpoint"
     )
+    parser.add_argument(
+        "--dpo_beta",
+        type=float,
+        default=0.1,
+        help="DPO beta parameter (temperature). Higher values (0.2-0.5) keep model closer to reference, lower values (0.01-0.1) allow more deviation. Default: 0.1",
+    )
+    parser.add_argument(
+        "--dpo_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for DPO loss. Default: 1.0",
+    )
+    parser.add_argument(
+        "--sft_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for SFT loss. Default: 1.0",
+    )
 
     return parser.parse_args()
 
@@ -92,88 +110,41 @@ def main():
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}_{args.save_name}"))
 
     # Model parameters based on experiment name
+    wandb_resume_id = None
+    model_cls = DiT
+    model_cfg = dict(
+        dim=1024,
+        depth=22,
+        heads=16,
+        ff_mult=2,
+        text_dim=512,
+        conv_layers=4,
+        emphasis_enhanced="transfomer",
+    )
 
-    if args.exp_name == "F5TTS_v1_Base":
-        wandb_resume_id = None
-        model_cls = DiT
-        model_cfg = dict(
-            dim=1024,
-            depth=22,
-            heads=16,
-            ff_mult=2,
-            text_dim=512,
-            conv_layers=4,
-            emphasis_enhanced="transfomer",
-        )
-        if args.finetune:
-            if args.pretrain is None:
-                ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"))
-            else:
-                ckpt_path = args.pretrain
+    ckpt_path = args.pretrain
+    if not os.path.isdir(checkpoint_path):
+        os.makedirs(checkpoint_path, exist_ok=True)
 
-    elif args.exp_name == "F5TTS_Base":
-        wandb_resume_id = None
-        model_cls = DiT
-        model_cfg = dict(
-            dim=1024,
-            depth=22,
-            heads=16,
-            ff_mult=2,
-            text_dim=512,
-            text_mask_padding=False,
-            conv_layers=4,
-            pe_attn_head=1,
-        )
-        if args.finetune:
-            if args.pretrain is None:
-                ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.pt"))
-            else:
-                ckpt_path = args.pretrain
-
-    elif args.exp_name == "E2TTS_Base":
-        wandb_resume_id = None
-        model_cls = UNetT
-        model_cfg = dict(
-            dim=1024,
-            depth=24,
-            heads=16,
-            ff_mult=4,
-            text_mask_padding=False,
-            pe_attn_head=1,
-        )
-        if args.finetune:
-            if args.pretrain is None:
-                ckpt_path = str(cached_path("hf://SWivid/E2-TTS/E2TTS_Base/model_1200000.pt"))
-            else:
-                ckpt_path = args.pretrain
-
-    if args.finetune:
-        if not os.path.isdir(checkpoint_path):
-            os.makedirs(checkpoint_path, exist_ok=True)
-
-        file_checkpoint = os.path.basename(ckpt_path)
-        if not file_checkpoint.startswith("pretrained_"):  # Change: Add 'pretrained_' prefix to copied model
-            file_checkpoint = "pretrained_" + file_checkpoint
-        file_checkpoint = os.path.join(checkpoint_path, file_checkpoint)
-        if not os.path.isfile(file_checkpoint):
-            shutil.copy2(ckpt_path, file_checkpoint)
-            print("copy checkpoint for finetune")
-
+    file_checkpoint = os.path.basename(ckpt_path)
+    if not file_checkpoint.startswith("pretrained_"):  # Change: Add 'pretrained_' prefix to copied model
+        file_checkpoint = "pretrained_" + file_checkpoint
+    file_checkpoint = os.path.join(checkpoint_path, file_checkpoint)
+    if not os.path.isfile(file_checkpoint):
+        shutil.copy2(ckpt_path, file_checkpoint)
+        print("copy checkpoint for finetune")
+  
     # Use the tokenizer and tokenizer_path provided in the command line arguments
-
-    tokenizer = args.tokenizer
-    if tokenizer == "custom":
-        if not args.tokenizer_path:
-            raise ValueError("Custom tokenizer selected, but no tokenizer_path provided.")
-        tokenizer_path = args.tokenizer_path
-    else:
-        tokenizer_path = args.dataset_name
-
-    vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
+    tokenizer = "pinyin"
+    tokenizer_path = "data/sft_data_pinyin/vocab.txt"
+    with open(tokenizer_path, "r", encoding="utf-8") as f:
+        vocab_char_map = {}
+        for i, char in enumerate(f):
+            vocab_char_map[char[:-1]] = i
+    vocab_size = len(vocab_char_map)
+    assert vocab_char_map[" "] == 0, "make sure space is of idx 0 in vocab.txt, cuz 0 is used for unknown char"
 
 
-    print("\nvocab : ", vocab_size)
-    print("\nvocoder : ", mel_spec_type)
 
     mel_spec_kwargs = dict(
         n_fft=n_fft,
@@ -184,9 +155,18 @@ def main():
         mel_spec_type=mel_spec_type,
     )
 
-    train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
-
-
+    train_dataset = DPODataset(
+        data_path=["/data/F5-TTS/outputs/batch_transformer_21500_dpo_data/dpo_metadata.json",
+                   "/data/F5-TTS/outputs/batch_stepf15_dpo_data/dpo_metadata.json",
+                   "/data/F5-TTS/outputs/batch_stepf06_dpo_data/dpo_metadata.json",
+                   "/data/F5-TTS/outputs/batch_stepm284_dpo_data/dpo_metadata.json"],
+        target_sample_rate=target_sample_rate,
+        hop_length=hop_length,
+        n_mel_channels=n_mel_channels,
+        n_fft=n_fft,
+        win_length=win_length,
+        mel_spec_type=mel_spec_type,
+    )
 
     model = CFM(
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
@@ -233,12 +213,14 @@ def main():
     for key, value in model_cfg.items():
         print(f"   - {key}: {value}")
     
+    
     print("=" * 60 + "\n")
 
-    trainer = Trainer(
+
+    trainer = DPOTrainer(
         model,
-        args.epochs,
-        args.learning_rate,
+        learning_rate=args.learning_rate,
+        epochs=args.epochs,
         num_warmup_updates=args.num_warmup_updates,
         save_per_updates=args.save_per_updates,
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
@@ -255,13 +237,20 @@ def main():
         log_samples=args.log_samples,
         last_per_updates=args.last_per_updates,
         bnb_optimizer=args.bnb_optimizer,
+        dpo_beta=args.dpo_beta,
+        dpo_loss_weight=args.dpo_loss_weight,
+        sft_loss_weight=args.sft_loss_weight,
     )
-
 
     trainer.train(
         train_dataset,
         resumable_with_seed=666,  # seed for shuffling dataset
     )
+
+    # trainer.test(
+    #     train_dataset,
+    #     resumable_with_seed=666,  # seed for shuffling dataset
+    # )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import json
+import os
 from importlib.resources import files
 
 import torch
@@ -11,7 +12,7 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from f5_tts.model.modules import MelSpec
-from f5_tts.model.utils import default
+from f5_tts.model.utils import convert_char_to_pinyin, default
 
 
 class HFDataset(Dataset):
@@ -130,6 +131,11 @@ class CustomDataset(Dataset):
             row = self.data[index]
             audio_path = row["audio_path"]
             text = row["text"]
+            text_list, emphasis_ids_list = convert_char_to_pinyin([text], train=True, return_emphasis_ids=True)
+            text = text_list[0]  # token list (pinyin tokens)
+            emphasis_ids = emphasis_ids_list[0]
+
+
             duration = row["duration"]
 
             # filter by given length
@@ -156,10 +162,110 @@ class CustomDataset(Dataset):
             mel_spec = self.mel_spectrogram(audio)
             mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
 
-        return {
+        result = {
             "mel_spec": mel_spec,
             "text": text,
+            "emphasis_ids": emphasis_ids
         }
+        
+        return result
+
+class DPODataset(Dataset):
+    def __init__(
+        self,
+        data_path: str,
+        target_sample_rate=24_000,
+        hop_length=256,
+        n_mel_channels=100,
+        n_fft=1024,
+        win_length=1024,
+        mel_spec_type="vocos",
+        mel_spec_module: nn.Module | None = None,
+    ):
+        super().__init__()
+        self.data = []
+        if isinstance(data_path, list):
+            for path in data_path:
+                with open(path, "r") as f:
+                    self.data.extend(json.load(f))
+        else:
+            with open(data_path, "r") as f:
+                self.data = json.load(f)
+
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.mel_spec_type = mel_spec_type
+
+        self.mel_spectrogram = default(
+            mel_spec_module,
+            MelSpec(
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                n_mel_channels=n_mel_channels,
+                target_sample_rate=target_sample_rate,
+                mel_spec_type=mel_spec_type,
+            ),
+        )
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def get_frame_len(self, index):
+        """Get the frame length for a given index, used by DynamicBatchSampler."""
+        # 使用 duration 计算帧数
+        chosen_duration = self.data[index]["chosen_duration"]
+        reject_duration = self.data[index]["reject_duration"]
+        # 使用较大的 duration 来计算，确保 batch 大小足够
+        max_duration = max(chosen_duration, reject_duration)
+        return max_duration * self.target_sample_rate / self.hop_length
+    
+    def __getitem__(self, index):
+        while True:
+            text = self.data[index]["text"]
+            text_list, emphasis_ids_list = convert_char_to_pinyin([text], return_emphasis_ids=True)
+            text = text_list[0]
+            emphasis_ids = emphasis_ids_list[0]
+
+            chosen_duration = self.data[index]["chosen_duration"]
+            reject_duration = self.data[index]["reject_duration"]
+
+            if 0.3 <= chosen_duration <= 30 and 0.3 <= reject_duration <= 30:
+                break
+                
+            index = (index + 1) % len(self.data)
+        
+        chosen_audio, chosen_sr = torchaudio.load(self.data[index]["chosen_wav_path"])
+        reject_audio, reject_sr = torchaudio.load(self.data[index]["reject_wav_path"])
+
+        if chosen_audio.shape[0] > 1:
+            chosen_audio = torch.mean(chosen_audio, dim=0, keepdim=True)
+        if reject_audio.shape[0] > 1:
+            reject_audio = torch.mean(reject_audio, dim=0, keepdim=True)
+        if chosen_sr != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(chosen_sr, self.target_sample_rate)
+            chosen_audio = resampler(chosen_audio)
+        if reject_sr != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(reject_sr, self.target_sample_rate)
+            reject_audio = resampler(reject_audio)
+        
+        chosen_mel_spec = self.mel_spectrogram(chosen_audio)
+        chosen_mel_spec = chosen_mel_spec.squeeze(0)
+        reject_mel_spec = self.mel_spectrogram(reject_audio)
+        reject_mel_spec = reject_mel_spec.squeeze(0)
+        
+        result = {
+            "chosen_mel_spec": chosen_mel_spec,
+            "reject_mel_spec": reject_mel_spec,
+            "text": text,
+            "emphasis_ids": emphasis_ids
+        }
+        return result
+
+
+
 
 
 # Dynamic Batch Sampler
@@ -194,6 +300,117 @@ class DynamicBatchSampler(Sampler[list[int]]):
         batch_frames = 0
         for idx, frame_len in tqdm(
             indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
+        ):
+            if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
+                batch.append(idx)
+                batch_frames += frame_len
+            else:
+                if len(batch) > 0:
+                    batches.append(batch)
+                if frame_len <= self.frames_threshold:
+                    batch = [idx]
+                    batch_frames = frame_len
+                else:
+                    batch = []
+                    batch_frames = 0
+
+        if not drop_residual and len(batch) > 0:
+            batches.append(batch)
+
+        del indices
+        self.batches = batches
+
+        # Ensure even batches with accelerate BatchSamplerShard cls under frame_per_batch setting
+        self.drop_last = True
+
+    def set_epoch(self, epoch: int) -> None:
+        """Sets the epoch for this sampler."""
+        self.epoch = epoch
+
+    def __iter__(self):
+        # Use both random_seed and epoch for deterministic but different shuffling per epoch
+        if self.random_seed is not None:
+            g = torch.Generator()
+            g.manual_seed(self.random_seed + self.epoch)
+            # Use PyTorch's random permutation for better reproducibility across PyTorch versions
+            indices = torch.randperm(len(self.batches), generator=g).tolist()
+            batches = [self.batches[i] for i in indices]
+        else:
+            batches = self.batches
+        return iter(batches)
+
+    def __len__(self):
+        return len(self.batches)
+
+
+class DPODynamicBatchSampler(Sampler[list[int]]):
+    """DPO-specific version of DynamicBatchSampler.
+    
+    This sampler is designed for DPO training where each sample contains
+    both chosen and rejected audio. It accounts for both audios when
+    calculating batch sizes to ensure proper memory management.
+    
+    Key differences from DynamicBatchSampler:
+    1. Each sample contains chosen + reject audio, so frame calculation
+       accounts for both audios
+    2. Optimized for DPO dataset structure with chosen/reject pairs
+    """
+
+    def __init__(
+        self, 
+        sampler: Sampler[int], 
+        frames_threshold: int, 
+        max_samples=0, 
+        random_seed=None, 
+        drop_residual: bool = False
+    ):
+        """
+        Args:
+            sampler: Base sampler to use (should sample from DPODataset)
+            frames_threshold: Maximum total frames per batch
+            max_samples: Maximum number of samples per batch (0 = no limit)
+            random_seed: Random seed for reproducible shuffling
+            drop_residual: Whether to drop the last incomplete batch
+        """
+        self.sampler = sampler
+        self.frames_threshold = frames_threshold
+        self.max_samples = max_samples
+        self.random_seed = random_seed
+        self.epoch = 0
+
+        indices, batches = [], []
+        data_source = self.sampler.data_source
+
+        # Verify this is a DPODataset
+        if not hasattr(data_source, '__class__') or data_source.__class__.__name__ != 'DPODataset':
+            import warnings
+            warnings.warn(
+                "DPODynamicBatchSampler is designed for DPODataset. "
+                "Using with other datasets may cause incorrect batch sizing."
+            )
+
+        for idx in tqdm(
+            self.sampler, 
+            desc="Sorting DPO samples with sampler... if slow, check whether dataset is provided with duration"
+        ):
+            # For DPO: each sample has chosen + reject audio
+            # get_frame_len returns max(chosen, reject) frames
+            # But we need to account for both audios in memory
+            # Using 2x to account for both chosen and reject frames
+            base_frame_len = data_source.get_frame_len(idx)
+            # Each DPO sample processes both chosen and reject separately
+            # They are padded independently in dpo_collate_fn
+            # So we multiply by 2 to account for both audios
+            dpo_frame_len = base_frame_len * 2
+            indices.append((idx, dpo_frame_len))
+        
+        indices.sort(key=lambda elem: elem[1])
+
+        batch = []
+        batch_frames = 0
+        for idx, frame_len in tqdm(
+            indices, 
+            desc=f"Creating DPO dynamic batches with {frames_threshold} audio frames per gpu (accounting for chosen+reject)"
         ):
             if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
                 batch.append(idx)
@@ -322,9 +539,95 @@ def collate_fn(batch):
     text = [item["text"] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
 
-    return dict(
+    result = dict(
         mel=mel_specs,
         mel_lengths=mel_lengths,  # records for padding mask
         text=text,
         text_lengths=text_lengths,
     )
+    
+    # handle emphasis_ids like text (as list)
+    if "emphasis_ids" in batch[0]:
+        emphasis_ids = [item["emphasis_ids"] for item in batch]
+        result["emphasis_ids"] = emphasis_ids
+   
+    
+    return result
+
+
+def dpo_collate_fn(batch):
+    """Collate function for DPO dataset.
+    
+    Handles batching of chosen/rejected mel spectrograms, text, and emphasis_ids.
+    Each batch item contains chosen and rejected mel specs that may have different lengths.
+    """
+    # Extract chosen and rejected mel specs
+    # DPODataset 返回的 mel_spec 已经是 (d, n) 格式（squeeze(0) 后），不需要再次 squeeze
+    chosen_mel_specs = [item["chosen_mel_spec"] for item in batch]
+    reject_mel_specs = [item["reject_mel_spec"] for item in batch]
+    
+    # Calculate lengths for chosen and rejected
+    chosen_mel_lengths = torch.LongTensor([spec.shape[-1] for spec in chosen_mel_specs])
+    reject_mel_lengths = torch.LongTensor([spec.shape[-1] for spec in reject_mel_specs])
+    
+    # Find max length for padding (separate for chosen and rejected)
+    max_chosen_mel_length = chosen_mel_lengths.amax()
+    max_reject_mel_length = reject_mel_lengths.amax()
+    
+    # Pad chosen mel specs
+    padded_chosen_mel_specs = []
+    for spec in chosen_mel_specs:
+        padding = (0, max_chosen_mel_length - spec.size(-1))
+        padded_spec = F.pad(spec, padding, value=0)
+        padded_chosen_mel_specs.append(padded_spec)
+    chosen_mel_specs = torch.stack(padded_chosen_mel_specs)
+    
+    # Pad rejected mel specs
+    padded_reject_mel_specs = []
+    for spec in reject_mel_specs:
+        padding = (0, max_reject_mel_length - spec.size(-1))
+        padded_spec = F.pad(spec, padding, value=0)
+        padded_reject_mel_specs.append(padded_spec)
+    reject_mel_specs = torch.stack(padded_reject_mel_specs)
+    
+    # Handle text
+    text = [item["text"] for item in batch]
+    text_lengths = torch.LongTensor([len(item) for item in text])
+    
+    result = dict(
+        chosen_mel_spec=chosen_mel_specs,
+        reject_mel_spec=reject_mel_specs,
+        chosen_mel_lengths=chosen_mel_lengths,
+        reject_mel_lengths=reject_mel_lengths,
+        text=text,
+        text_lengths=text_lengths,
+    )
+    
+    # Handle emphasis_ids if present
+    if "emphasis_ids" in batch[0]:
+        emphasis_ids = [item["emphasis_ids"] for item in batch]
+        result["emphasis_ids"] = emphasis_ids
+    
+    return result
+
+
+if __name__ == "__main__":
+    target_sample_rate = 24000
+    n_mel_channels = 100
+    hop_length = 256
+    win_length = 1024
+    n_fft = 1024
+    mel_spec_type = "vocos" 
+
+    mel_spec_kwargs = dict(
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        n_mel_channels=n_mel_channels,
+        target_sample_rate=target_sample_rate,
+        mel_spec_type=mel_spec_type,
+    )
+    train_dataset = load_dataset(dataset_name="sft_data", tokenizer="pinyin", mel_spec_kwargs=mel_spec_kwargs)
+
+
+    print(train_dataset[0])

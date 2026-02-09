@@ -156,9 +156,10 @@ class SinusPositionEmbedding(nn.Module):
 
     def forward(self, x, scale=1000):
         device = x.device
+        dtype = x.dtype  # 使用输入 x 的 dtype，而不是强制使用 float32
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
         emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb

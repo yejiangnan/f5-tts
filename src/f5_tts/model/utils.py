@@ -145,46 +145,87 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
 # convert char to pinyin
 
 
-def convert_char_to_pinyin(text_list, polyphone=True):
-    final_text_list = []
-    custom_trans = str.maketrans(
-        {";": ",", "“": '"', "”": '"', "‘": "'", "’": "'"}
-    )  # add custom trans here, to address oov
+def convert_char_to_pinyin(text_list, train=False, polyphone=True, return_emphasis_ids=False):
+    if not train:
+        final_text_list = []
+        custom_trans = str.maketrans(
+            {";": ",", "“": '"', "”": '"', "‘": "'", "’": "'"}
+        )  # add custom trans here, to address oov
 
-    def is_chinese(c):
-        return (
-            "\u3100" <= c <= "\u9fff"  # common chinese characters
-        )
-
-    for text in text_list:
-        char_list = []
-        text = text.translate(custom_trans)
-        for seg in rjieba.cut(text):
-            seg_byte_len = len(bytes(seg, "UTF-8"))
-            if seg_byte_len == len(seg):  # if pure alphabets and symbols
-                if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
-                    char_list.append(" ")
-                char_list.extend(seg)
-            elif polyphone and seg_byte_len == 3 * len(seg):  # if pure east asian characters
-                seg_ = lazy_pinyin(seg, style=Style.TONE3, tone_sandhi=True)
-                for i, c in enumerate(seg):
-                    if is_chinese(c):
+        def is_chinese(c):
+            return (
+                "\u3100" <= c <= "\u9fff"  # common chinese characters
+            )
+        for text in text_list:
+            char_list = []
+            text = text.translate(custom_trans)
+            for seg in rjieba.cut(text):
+                seg_byte_len = len(bytes(seg, "UTF-8"))
+                if seg_byte_len == len(seg):  # if pure alphabets and symbols
+                    if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
                         char_list.append(" ")
-                    char_list.append(seg_[i])
-            else:  # if mixed characters, alphabets and symbols
-                for c in seg:
-                    if ord(c) < 256:
-                        char_list.extend(c)
-                    elif is_chinese(c):
-                        char_list.append(" ")
-                        char_list.extend(lazy_pinyin(c, style=Style.TONE3, tone_sandhi=True))
-                    else:
-                        char_list.append(c)
-        final_text_list.append(char_list)
+                    char_list.extend(seg)
+                elif polyphone and seg_byte_len == 3 * len(seg):  # if pure east asian characters
+                    seg_ = lazy_pinyin(seg, style=Style.TONE3, tone_sandhi=True)
+                    for i, c in enumerate(seg):
+                        if is_chinese(c):
+                            char_list.append(" ")
+                        char_list.append(seg_[i])
+                else:  # if mixed characters, alphabets and symbols
+                    for c in seg:
+                        if ord(c) < 256:
+                            char_list.extend(c)
+                        elif is_chinese(c):
+                            char_list.append(" ")
+                            char_list.extend(lazy_pinyin(c, style=Style.TONE3, tone_sandhi=True))
+                        else:
+                            char_list.append(c)
+            final_text_list.append(char_list)
+    else:
+        final_text_list = text_list
+    
+    return_text = []
+    return_emphasis_ids = []
+    for tmp in final_text_list:
+        text = []
+        i = 0
+        while i < len(tmp):
+            if tmp[i] == '<':
+                j = i + 1
+                while j < len(tmp) and tmp[j] != '>':
+                    j += 1
+                text.append((''.join(tmp[i:j + 1]).replace(' ', '')))
+                i = j + 1
+            else:
+                text.append(tmp[i])
+                i += 1   
+        
+            
+        emphasis_ids = []
+        flag = False
+        for i in range(len(text)):
+            if text[i] == '<strong>':
+                flag = True
+                continue
+            elif text[i - 1] == '</strong>':
+                flag = False
+                continue
 
-    return final_text_list
+            if flag:
+                emphasis_ids.append(1)
+            else:
+                emphasis_ids.append(0)
 
+                
+        # 移除所有的 <strong> 和 </strong> 标签（不是只移除第一个）
+        text = [x for x in text if x not in ['<strong>', '</strong>']]
+        return_emphasis_ids.append(emphasis_ids)
+        return_text.append(text)
 
+    if return_emphasis_ids:
+        return return_text, return_emphasis_ids
+    else:
+        return return_text
 # filter func for dirty data with many repetitions
 
 

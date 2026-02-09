@@ -20,10 +20,11 @@ import torchaudio
 from datasets.arrow_writer import ArrowWriter
 from tqdm import tqdm
 
-from f5_tts.model.utils import convert_char_to_pinyin
+from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer
 
 
 PRETRAINED_VOCAB_PATH = files("f5_tts").joinpath("../../data/Emilia_ZH_EN_pinyin/vocab.txt")
+# PRETRAINED_VOCAB_PATH = Path("/data/F5-TTS/src/f5_tts/infer/examples/vocab_extended.txt")
 
 
 def is_csv_wavs_format(input_dataset_dir):
@@ -79,7 +80,7 @@ def process_audio_file(audio_path, text, polyphone):
         return None
 
 
-def batch_convert_texts(texts, polyphone, batch_size=BATCH_SIZE):
+def batch_convert_texts(texts, polyphone, batch_size=BATCH_SIZE, vocab_char_map=None):
     """Convert a list of texts to pinyin in batches."""
     converted_texts = []
     for i in range(0, len(texts), batch_size):
@@ -89,7 +90,7 @@ def batch_convert_texts(texts, polyphone, batch_size=BATCH_SIZE):
     return converted_texts
 
 
-def prepare_csv_wavs_dir(input_dir, num_workers=None):
+def prepare_csv_wavs_dir(input_dir, num_workers=None, vocab_char_map=None):
     global executor
     assert is_csv_wavs_format(input_dir), f"not csv_wavs format: {input_dir}"
     input_dir = Path(input_dir)
@@ -139,7 +140,7 @@ def prepare_csv_wavs_dir(input_dir, num_workers=None):
 
     # Batch process text conversion
     raw_texts = [item[1] for item in processed]
-    converted_texts = batch_convert_texts(raw_texts, polyphone, batch_size=BATCH_SIZE)
+    converted_texts = batch_convert_texts(raw_texts, polyphone, batch_size=BATCH_SIZE, vocab_char_map=vocab_char_map)
 
     # Prepare final results
     sub_result = []
@@ -236,9 +237,13 @@ def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_fine
 
 
 def prepare_and_save_set(inp_dir, out_dir, is_finetune: bool = True, num_workers: int = None):
+    # Load vocab_char_map if finetune (to preserve special tokens like <strong>)
+    vocab_char_map = None
     if is_finetune:
         assert PRETRAINED_VOCAB_PATH.exists(), f"pretrained vocab.txt not found: {PRETRAINED_VOCAB_PATH}"
-    sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir, num_workers=num_workers)
+        vocab_char_map, _ = get_tokenizer(PRETRAINED_VOCAB_PATH.as_posix(), tokenizer="custom")
+    
+    sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir, num_workers=num_workers, vocab_char_map=vocab_char_map)
     save_prepped_dataset(out_dir, sub_result, durations, vocab_set, is_finetune)
 
 

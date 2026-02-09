@@ -37,6 +37,7 @@ class TextEmbedding(nn.Module):
     def __init__(self, text_num_embeds, text_dim, mask_padding=True, conv_layers=0, conv_mult=2):
         super().__init__()
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
+        self.emphasis_embed = nn.Embedding(2, text_dim)  # 0: no emphasis, 1: emphasis
 
         self.mask_padding = mask_padding  # mask filler and batch padding tokens or not
 
@@ -50,7 +51,7 @@ class TextEmbedding(nn.Module):
         else:
             self.extra_modeling = False
 
-    def forward(self, text: int["b nt"], seq_len, drop_text=False):
+    def forward(self, text: int["b nt"], seq_len, drop_text=False, emphasis_ids: int["b nt"] | None = None):
         text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
         batch, text_len = text.shape[0], text.shape[1]
@@ -62,6 +63,15 @@ class TextEmbedding(nn.Module):
             text = torch.zeros_like(text)
 
         text = self.text_embed(text)  # b n -> b n d
+        
+        # Add emphasis embedding if provided
+        if emphasis_ids is not None:
+            # Pad emphasis_ids to match text length
+            if emphasis_ids.shape[1] < seq_len:
+                emphasis_ids = F.pad(emphasis_ids, (0, seq_len - emphasis_ids.shape[1]), value=0)
+            elif emphasis_ids.shape[1] > seq_len:
+                emphasis_ids = emphasis_ids[:, :seq_len]
+            text = text + self.emphasis_embed(emphasis_ids)
 
         # possible extra modeling
         if self.extra_modeling:
@@ -193,19 +203,20 @@ class UNetT(nn.Module):
         drop_audio_cond: bool = False,
         drop_text: bool = False,
         cache: bool = True,
+        emphasis_ids: int["b nt"] | None = None,
     ):
         seq_len = x.shape[1]
         if cache:
             if drop_text:
                 if self.text_uncond is None:
-                    self.text_uncond = self.text_embed(text, seq_len, drop_text=True)
+                    self.text_uncond = self.text_embed(text, seq_len, drop_text=True, emphasis_ids=emphasis_ids)
                 text_embed = self.text_uncond
             else:
                 if self.text_cond is None:
-                    self.text_cond = self.text_embed(text, seq_len, drop_text=False)
+                    self.text_cond = self.text_embed(text, seq_len, drop_text=False, emphasis_ids=emphasis_ids)
                 text_embed = self.text_cond
         else:
-            text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
+            text_embed = self.text_embed(text, seq_len, drop_text=drop_text, emphasis_ids=emphasis_ids)
 
         x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
 
@@ -225,6 +236,7 @@ class UNetT(nn.Module):
         drop_text: bool = False,  # cfg for text
         cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
         cache: bool = False,
+        emphasis_ids: int["b nt"] | None = None,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
@@ -233,13 +245,13 @@ class UNetT(nn.Module):
         # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
         t = self.time_embed(time)
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
-            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache)
-            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache)
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, emphasis_ids=emphasis_ids)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, emphasis_ids=emphasis_ids)
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
         else:
-            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache)
+            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache, emphasis_ids=emphasis_ids)
 
         # postfix time t to input x, [b n d] -> [b n+1 d]
         x = torch.cat([t.unsqueeze(1), x], dim=1)  # pack t to x

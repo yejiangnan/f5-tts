@@ -197,7 +197,7 @@ edit_mask = F.pad(edit_mask, (0, mel_cond.shape[1] - edit_mask.shape[-1]), value
 # Text
 text_list = [target_text]
 if tokenizer == "pinyin":
-    final_text_list = convert_char_to_pinyin(text_list)
+    final_text_list = convert_char_to_pinyin(text_list, vocab_char_map=vocab_char_map)
 else:
     final_text_list = [text_list]
 print(f"text  : {text_list}")

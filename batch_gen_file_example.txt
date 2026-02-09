@@ -1,0 +1,6 @@
+<strong>这种</strong>行为是绝对不能被原谅的。
+这种<strong>行为</strong>是绝对不能被原谅的。
+这种行为<strong>是</strong>绝对不能被原谅的。
+这种行为是<strong>绝对</strong>不能被原谅的。
+这种行为是绝对<strong>不能</strong>被原谅的。
+这种行为是绝对不能被<strong>原谅</strong>的。

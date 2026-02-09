@@ -13,7 +13,11 @@ from cached_path import cached_path
 from hydra.utils import get_class
 from omegaconf import OmegaConf
 from unidecode import unidecode
+from torch.utils.data import DataLoader, Dataset, SequentialSampler
 
+from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
+from f5_tts.model.dataset import load_dataset
+from f5_tts.model.utils import get_tokenizer
 from f5_tts.infer.utils_infer import (
     cfg_strength,
     cross_fade_duration,
@@ -253,55 +257,71 @@ if save_chunk:
 
 # load vocoder
 
-if vocoder_name == "vocos":
-    vocoder_local_path = "../checkpoints/vocos-mel-24khz"
-elif vocoder_name == "bigvgan":
-    vocoder_local_path = "../checkpoints/bigvgan_v2_24khz_100band_256x"
 
-vocoder = load_vocoder(
-    vocoder_name=vocoder_name, is_local=load_vocoder_from_local, local_path=vocoder_local_path, device=device
-)
-
-
-# load TTS model
-model_cfg = OmegaConf.load(
-    args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
-)
-model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
-model_arc = model_cfg.model.arch
-
-repo_name, ckpt_step, ckpt_type = "F5-TTS", 1250000, "safetensors"
-
-if model != "F5TTS_Base":
-    assert vocoder_name == model_cfg.model.mel_spec.mel_spec_type
-
-# override for previous models
-if model == "F5TTS_Base":
+def load_vocoder_infer(vocoder_name="vocos"):
     if vocoder_name == "vocos":
-        ckpt_step = 1200000
+        vocoder_local_path = "../checkpoints/vocos-mel-24khz"
     elif vocoder_name == "bigvgan":
-        model = "F5TTS_Base_bigvgan"
-        ckpt_type = "pt"
-elif model == "E2TTS_Base":
-    repo_name = "E2-TTS"
-    ckpt_step = 1200000
+        vocoder_local_path = "../checkpoints/bigvgan_v2_24khz_100band_256x"
 
-if not ckpt_file:
-    ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
+    vocoder = load_vocoder(
+        vocoder_name=vocoder_name, is_local=load_vocoder_from_local, local_path=vocoder_local_path, device=device
+    )
+    return vocoder
 
-print(f"Using {model}...")
-ema_model = load_model(
-    model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device
-)
+def load_model_infer(model, ckpt_file, vocab_file):
+    # load TTS model
+    model_cfg = OmegaConf.load(
+        args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
+    )
+    model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
+    model_arc = model_cfg.model.arch
+
+    repo_name, ckpt_step, ckpt_type = "F5-TTS", 1250000, "safetensors"
+
+    if model != "F5TTS_Base":
+        assert vocoder_name == model_cfg.model.mel_spec.mel_spec_type
+
+    model = "F5TTS_v1_Base"
+
+    # override for previous models
+    if model == "F5TTS_Base":
+        if vocoder_name == "vocos":
+            ckpt_step = 1200000
+        elif vocoder_name == "bigvgan":
+            model = "F5TTS_Base_bigvgan"
+            ckpt_type = "pt"
+    elif model == "E2TTS_Base":
+        repo_name = "E2-TTS"
+        ckpt_step = 1200000
+
+    if not ckpt_file:
+        ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
+
+    ema_model = load_model(
+        model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device
+    )
+
+    return ema_model
 
 
 # inference process
 
-
 def main():
+    
+    
 
-    
-    
+    model = args.model or config.get("model", "F5TTS_v1_Base")
+    model = "F5TTS_v1_Base"
+    ckpt_file = "ckpts/sft_data/model_14500.pt"
+    vocab_file = "data/sft_data_pinyin/vocab.txt"
+    ref_audio = "/data/F5-TTS/data/sft_data/wavs/393.wav"
+    ref_text = "由此可见，城市本身已具备现代战争的某些特性。这不单是人口数量问题，<strong>更</strong>涉及到经济布局和基础设施等多重因素。"
+    gen_text = "由此可见，城市本身已具备现代战争的某些特性。这不单是人口数量问题，<strong>更</strong>涉及到经济布局和基础设施等多重因素。"
+
+    ema_model = load_model_infer(model=model, ckpt_file=ckpt_file, vocab_file=vocab_file)
+    vocoder = load_vocoder_infer()
+
     main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
     if "voices" not in config:
         voices = {"main": main_voice}
@@ -328,18 +348,15 @@ def main():
         if match:
             voice = match[1]
         else:
-            print("No voice tag found, using main.")
             voice = "main"
         if voice not in voices:
-            print(f"Voice {voice} not found, using main.")
             voice = "main"
         text = re.sub(reg2, "", text)
         ref_audio_ = voices[voice]["ref_audio"]
         ref_text_ = voices[voice]["ref_text"]
         local_speed = voices[voice].get("speed", speed)
         gen_text_ = text.strip()
-        print(f"Voice: {voice}")
-        print(f"Original gen_text: {gen_text_}")
+
         audio_segment, final_sample_rate, spectrogram = infer_process(
             ref_audio_,
             ref_text_,

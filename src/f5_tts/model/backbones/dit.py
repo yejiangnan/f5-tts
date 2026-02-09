@@ -31,10 +31,61 @@ from f5_tts.model.modules import (
 
 class TextEmbedding(nn.Module):
     def __init__(
-        self, text_num_embeds, text_dim, mask_padding=True, average_upsampling=False, conv_layers=0, conv_mult=2
+        self, text_num_embeds, text_dim, mask_padding=True, average_upsampling=False, conv_layers=0, conv_mult=2,
+        emphasis_enhanced="mlp", emphasis_dim=None
     ):
         super().__init__()
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
+        # self.emphasis_embed = nn.Embedding(2, text_dim)  # 0: no emphasis, 1: emphasis
+        # Initialize emphasis_embed with zeros
+        # nn.init.zeros_(self.emphasis_embed.weight)
+        
+        # 增强的 emphasis 机制
+        self.emphasis_enhanced = emphasis_enhanced
+        if emphasis_enhanced == "mlp":
+            emphasis_dim = emphasis_dim or text_dim
+            # 可学习的缩放因子
+            self.emphasis_scale = nn.Parameter(torch.ones(1) * 1.5)  # 初始化为1.5，可学习
+            # MLP 处理 emphasis embedding（基于当前 text embedding 生成）
+            self.emphasis_mlp = nn.Sequential(
+                nn.Linear(text_dim, emphasis_dim),
+                nn.SiLU(),
+                nn.Linear(emphasis_dim, text_dim)
+            )
+            # 门控机制控制 emphasis 强度
+            self.emphasis_gate = nn.Sequential(
+                nn.Linear(text_dim, text_dim),
+                nn.Sigmoid()
+            )
+
+        elif emphasis_enhanced == "transfomer":
+            # 为 transformer 方案创建位置编码（如果不存在）
+            # 因为 DiTBlock 需要位置信息，即使没有 ConvNeXtV2Block
+            if conv_layers == 0:
+                self.precompute_max_pos = 8192
+                self.register_buffer("freqs_cis", precompute_freqs_cis(text_dim, self.precompute_max_pos), persistent=False)
+            
+            # 创建 DiTBlock 用于 emphasis 处理
+            self.emphasis_block = DiTBlock(
+                    dim=text_dim,
+                    heads=8,
+                    dim_head=64,
+                    ff_mult=4,
+                    dropout=0.1,
+                    qk_norm=None,
+                    pe_attn_head=None,
+                    attn_backend="torch",
+                    attn_mask_enabled=False,
+                )
+            # DiTBlock 需要 time embedding，创建一个固定的 time embedding
+            # 使用 TimestepEmbedding 但固定输入为 0（表示不需要 diffusion 时间步）
+            self.emphasis_time_embed_module = TimestepEmbedding(text_dim)
+            # 创建 RotaryEmbedding 用于 rope
+            self.emphasis_rotary = RotaryEmbedding(64)  # dim_head=64
+        else:
+            # 原始简单版本（向后兼容）
+            self.emphasis_embed = nn.Parameter(torch.zeros(text_dim))  # 全0初始化的可学习参数
+
 
         self.mask_padding = mask_padding  # mask filler and batch padding tokens or not
         self.average_upsampling = average_upsampling  # zipvoice-style text late average upsampling (after text encoder)
@@ -83,7 +134,7 @@ class TextEmbedding(nn.Module):
 
         return upsampled_text
 
-    def forward(self, text: int["b nt"], seq_len, drop_text=False):
+    def forward(self, text: int["b nt"], seq_len, drop_text=False, emphasis_ids: int["b nt"] | None = None):
         text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
         text = F.pad(text, (0, seq_len - text.shape[1]), value=0)  # (opt.) if not self.average_upsampling:
@@ -94,6 +145,65 @@ class TextEmbedding(nn.Module):
             text = torch.zeros_like(text)
 
         text = self.text_embed(text)  # b n -> b n d
+        
+        # Add emphasis embedding if provided
+        if emphasis_ids is not None:
+            # Pad emphasis_ids to match text length
+            if emphasis_ids.shape[1] < seq_len:
+                emphasis_ids = F.pad(emphasis_ids, (0, seq_len - emphasis_ids.shape[1]), value=0)
+            elif emphasis_ids.shape[1] > seq_len:
+                emphasis_ids = emphasis_ids[:, :seq_len]
+            
+            if self.emphasis_enhanced == "mlp":
+                # 增强的 emphasis 处理
+                # 使用与 text 相同的数据类型，避免类型不匹配
+                emphasis_mask = emphasis_ids.unsqueeze(-1).to(dtype=text.dtype)  # (b, n, 1)
+                
+                # 方法1: 基于当前 text embedding 生成 emphasis embedding（更智能）
+                emphasis_embed = self.emphasis_mlp(text)  # [b, n, d]
+                emphasis_embed = emphasis_embed * self.emphasis_scale  # 可学习缩放
+                
+                # 方法2: 门控机制，根据 text 内容自适应调整 emphasis 强度
+                gate = self.emphasis_gate(text)  # [b, n, d]
+                emphasis_embed = emphasis_embed * gate
+                
+                # 应用到 emphasis 位置
+                text = text + emphasis_mask * emphasis_embed
+            elif self.emphasis_enhanced == "transfomer":
+                # 添加位置编码（如果存在）
+                text_input = text.clone()
+                if hasattr(self, 'freqs_cis'):
+                    text_input = text_input + self.freqs_cis[:seq_len, :]
+                
+                # DiTBlock 需要 time embedding 和 rope
+                batch_size = text.shape[0]
+                device = text.device
+                dtype = text.dtype  # 确保使用与 text 相同的 dtype
+                
+                # 创建固定的 time embedding（输入为 0，表示不需要 diffusion 时间步）
+                t_zero = torch.zeros(batch_size, device=device, dtype=dtype)
+                t_embed = self.emphasis_time_embed_module(t_zero)  # [b, text_dim]
+                
+                # 创建 rope（Rotary Position Embedding）
+                rope = self.emphasis_rotary.forward_from_seq_len(seq_len)
+                
+                # 先让整个 text 通过 DiTBlock 处理（捕获上下文信息）
+                text_processed = self.emphasis_block(text_input, t=t_embed, mask=None, rope=rope)
+                
+                # 计算 DiTBlock 产生的增量（delta），避免重复叠加原始 text
+                # text_processed = text_input + delta，所以 delta = text_processed - text_input
+                delta = text_processed - text_input
+                
+                # 使用 emphasis mask：在重音位置将增量加到 text 上，其他位置保持原样
+                emphasis_mask = emphasis_ids.unsqueeze(-1).to(dtype=text.dtype)  # (b, n, 1) - 使用原始 text 的 dtype
+                
+                # 方案：重音位置加上 DiTBlock 的增量，非重音位置保持原样
+                text = text + delta * emphasis_mask
+            else:
+                # 原始简单版本（向后兼容）
+                emphasis_mask = emphasis_ids.unsqueeze(-1)  # (b, n, 1)
+                text = text + emphasis_mask * self.emphasis_embed.unsqueeze(0).unsqueeze(0)  # (b, n, d)
+
 
         # possible extra modeling
         if self.extra_modeling:
@@ -165,6 +275,8 @@ class DiT(nn.Module):
         attn_mask_enabled=False,
         long_skip_connection=False,
         checkpoint_activations=False,
+        emphasis_enhanced="mlp",  # 是否使用增强的 emphasis 机制
+        emphasis_dim=None,  # emphasis MLP 的中间维度，None 则使用 text_dim
     ):
         super().__init__()
 
@@ -177,6 +289,8 @@ class DiT(nn.Module):
             mask_padding=text_mask_padding,
             average_upsampling=text_embedding_average_upsampling,
             conv_layers=conv_layers,
+            emphasis_enhanced=emphasis_enhanced,
+            emphasis_dim=emphasis_dim,
         )
         self.text_cond, self.text_uncond = None, None  # text cache
         self.input_embed = InputEmbedding(mel_dim, text_dim, dim)
@@ -240,22 +354,26 @@ class DiT(nn.Module):
         drop_text: bool = False,
         cache: bool = True,
         audio_mask: bool["b n"] | None = None,
+        emphasis_ids: int["b nt"] | None = None,
     ):
         if self.text_uncond is None or self.text_cond is None or not cache:
             if audio_mask is None:
-                text_embed = self.text_embed(text, x.shape[1], drop_text=drop_text)
+                text_embed = self.text_embed(text, x.shape[1], drop_text=drop_text, emphasis_ids=emphasis_ids)
             else:
                 batch = x.shape[0]
                 seq_lens = audio_mask.sum(dim=1)  # Calculate the actual sequence length for each sample
                 text_embed_list = []
                 for i in range(batch):
+                    emphasis_ids_i = emphasis_ids[i].unsqueeze(0) if emphasis_ids is not None else None
                     text_embed_i = self.text_embed(
                         text[i].unsqueeze(0),
                         seq_len=seq_lens[i].item(),
                         drop_text=drop_text,
+                        emphasis_ids=emphasis_ids_i,
                     )
                     text_embed_list.append(text_embed_i[0])
                 text_embed = pad_sequence(text_embed_list, batch_first=True, padding_value=0)
+
             if cache:
                 if drop_text:
                     self.text_uncond = text_embed
@@ -286,6 +404,7 @@ class DiT(nn.Module):
         drop_text: bool = False,  # cfg for text
         cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
         cache: bool = False,
+        emphasis_ids: int["b nt"] | None = None,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
@@ -295,17 +414,17 @@ class DiT(nn.Module):
         t = self.time_embed(time)
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
             x_cond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask, emphasis_ids=emphasis_ids
             )
             x_uncond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask, emphasis_ids=emphasis_ids
             )
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
         else:
             x = self.get_input_embed(
-                x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache, audio_mask=mask, emphasis_ids=emphasis_ids
             )
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)

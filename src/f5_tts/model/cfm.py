@@ -99,6 +99,7 @@ class CFM(nn.Module):
         duplicate_test=False,
         t_inter=0.1,
         edit_mask=None,
+        emphasis_ids: int["b nt"] | None = None,
     ):
         self.eval()
         # raw wave
@@ -122,6 +123,17 @@ class CFM(nn.Module):
             else:
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
+
+        if isinstance(emphasis_ids, list):
+            # Handle both single sample [1, 0, 1] and batch [[1, 0, 1], [0, 1, 0]]
+            if len(emphasis_ids) > 0 and isinstance(emphasis_ids[0], list):
+                # Multiple samples: use pad_sequence
+                emphasis_ids_list = [torch.tensor(ids, dtype=torch.long) for ids in emphasis_ids]
+                emphasis_ids = pad_sequence(emphasis_ids_list, padding_value=0, batch_first=True).to(device)
+            else:
+                # Single sample: convert to tensor and add batch dimension
+                emphasis_ids = torch.tensor(emphasis_ids, dtype=torch.long).to(device)
+                emphasis_ids = emphasis_ids.unsqueeze(0)
 
         # duration
 
@@ -174,6 +186,7 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    emphasis_ids=emphasis_ids,
                 )
                 return pred
 
@@ -186,6 +199,7 @@ class CFM(nn.Module):
                 mask=mask,
                 cfg_infer=True,
                 cache=True,
+                emphasis_ids=emphasis_ids,
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * cfg_strength
@@ -232,10 +246,30 @@ class CFM(nn.Module):
         self,
         inp: float["b n d"] | float["b nw"],  # mel or raw wave
         text: int["b nt"] | list[str],
+        time: float["b"] | float[""] = None,
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        emphasis_ids: int["b nt"] | None = None,
+
+        # dpo
+        is_dpo: bool = False,
+        noise: float["b n d"] | None = None,
+        span_mask: bool["b n"] | None = None,  
     ):
+        if is_dpo:
+            return self.forward_dpo(
+                inp, 
+                text, 
+                time, 
+                lens=lens, 
+                noise_scheduler=noise_scheduler, 
+                emphasis_ids=emphasis_ids, 
+                noise=noise, 
+                span_mask=span_mask,
+            )
+
+
         # handle raw wave
         if inp.ndim == 2:
             inp = self.mel_spec(inp)
@@ -251,6 +285,18 @@ class CFM(nn.Module):
             else:
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
+            
+        # handle emphasis_ids like text (as list)
+        if isinstance(emphasis_ids, list):
+            # Handle both single sample [1, 0, 1] and batch [[1, 0, 1], [0, 1, 0]]
+            if len(emphasis_ids) > 0 and isinstance(emphasis_ids[0], list):
+                # Multiple samples: use pad_sequence
+                emphasis_ids_list = [torch.tensor(ids, dtype=torch.long) for ids in emphasis_ids]
+                emphasis_ids = pad_sequence(emphasis_ids_list, padding_value=0, batch_first=True).to(device)
+            else:
+                # Single sample: convert to tensor and add batch dimension
+                emphasis_ids = torch.tensor(emphasis_ids, dtype=torch.long).to(device)
+                emphasis_ids = emphasis_ids.unsqueeze(0)
 
         # lens and mask
         if not exists(lens):  # if lens not acquired by trainer from collate_fn
@@ -271,7 +317,9 @@ class CFM(nn.Module):
         x0 = torch.randn_like(x1)
 
         # time step
-        time = torch.rand((batch,), dtype=dtype, device=self.device)
+        if not exists(time):
+            time = torch.rand((batch,), dtype=dtype, device=self.device)
+
         # TODO. noise_scheduler
 
         # sample xt (φ_t(x) in the paper)
@@ -292,7 +340,7 @@ class CFM(nn.Module):
 
         # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
         pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask, emphasis_ids=emphasis_ids
         )
 
         # flow matching loss
@@ -300,3 +348,93 @@ class CFM(nn.Module):
         loss = loss[rand_span_mask]
 
         return loss.mean(), cond, pred
+
+    def forward_dpo(
+        self,
+        inp: float["b n d"] | float["b nw"],  # mel or raw wave
+        text: int["b nt"] | list[str],
+        time: float["b"] | float[""],
+        *,
+        lens: int["b"] | None = None,
+        noise_scheduler: str | None = None,
+        emphasis_ids: int["b nt"] | None = None,
+
+        noise: float["b n d"] | None = None,
+        span_mask: bool["b n"] | None = None,  
+    ):
+
+        # handle raw wave
+        if inp.ndim == 2:
+            inp = self.mel_spec(inp)
+            inp = inp.permute(0, 2, 1)
+            assert inp.shape[-1] == self.num_channels
+
+        batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
+
+        # handle text as string
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+            
+        # handle emphasis_ids like text (as list)
+        if isinstance(emphasis_ids, list):
+            # Handle both single sample [1, 0, 1] and batch [[1, 0, 1], [0, 1, 0]]
+            if len(emphasis_ids) > 0 and isinstance(emphasis_ids[0], list):
+                # Multiple samples: use pad_sequence
+                emphasis_ids_list = [torch.tensor(ids, dtype=torch.long) for ids in emphasis_ids]
+                emphasis_ids = pad_sequence(emphasis_ids_list, padding_value=0, batch_first=True).to(device)
+            else:
+                # Single sample: convert to tensor and add batch dimension
+                emphasis_ids = torch.tensor(emphasis_ids, dtype=torch.long).to(device)
+                emphasis_ids = emphasis_ids.unsqueeze(0)
+
+        # lens and mask
+        if not exists(lens):  # if lens not acquired by trainer from collate_fn
+            lens = torch.full((batch,), seq_len, device=device)
+        mask = lens_to_mask(lens, length=seq_len)
+        rand_span_mask = span_mask
+        if exists(mask):
+            rand_span_mask &= mask
+
+        # mel is x1
+        x1 = inp
+
+        # x0 is gaussian noise
+        x0 = noise
+
+
+        # sample xt (φ_t(x) in the paper)
+        t = time.unsqueeze(-1).unsqueeze(-1)
+        φ = (1 - t) * x0 + t * x1
+        flow = x1 - x0
+
+        # only predict what is within the random mask span for infilling
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        # transformer and cfg training with a drop rate
+        drop_audio_cond = False
+        drop_text = False
+
+        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
+        pred = self.transformer(
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask, emphasis_ids=emphasis_ids
+        )
+
+        # flow matching loss
+        loss = F.mse_loss(pred, flow, reduction="none")
+        if rand_span_mask.ndim == 2:
+            mask_expanded = rand_span_mask.unsqueeze(-1) # [B, T, 1]
+        else:
+            mask_expanded = rand_span_mask
+
+        loss = loss * mask_expanded.type_as(loss)
+        loss_sum = loss.sum(dim=[1, 2])
+        num_elements = mask_expanded.sum(dim=1).squeeze(-1) * self.num_channels
+        
+        loss_per_sample = loss_sum / (num_elements + 1e-8)
+
+        # 返回 [Batch_Size] 大小的向量，而不是标量
+        return loss_per_sample, cond, pred
