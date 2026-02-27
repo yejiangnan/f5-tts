@@ -82,9 +82,7 @@ class TextEmbedding(nn.Module):
             self.emphasis_time_embed_module = TimestepEmbedding(text_dim)
             # 创建 RotaryEmbedding 用于 rope
             self.emphasis_rotary = RotaryEmbedding(64)  # dim_head=64
-        else:
-            # 原始简单版本（向后兼容）
-            self.emphasis_embed = nn.Parameter(torch.zeros(text_dim))  # 全0初始化的可学习参数
+
 
 
         self.mask_padding = mask_padding  # mask filler and batch padding tokens or not
@@ -199,10 +197,6 @@ class TextEmbedding(nn.Module):
                 
                 # 方案：重音位置加上 DiTBlock 的增量，非重音位置保持原样
                 text = text + delta * emphasis_mask
-            else:
-                # 原始简单版本（向后兼容）
-                emphasis_mask = emphasis_ids.unsqueeze(-1)  # (b, n, 1)
-                text = text + emphasis_mask * self.emphasis_embed.unsqueeze(0).unsqueeze(0)  # (b, n, d)
 
 
         # possible extra modeling

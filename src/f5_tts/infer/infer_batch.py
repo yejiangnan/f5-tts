@@ -199,6 +199,12 @@ parser.add_argument(
     default=None,
     help="Number of parallel processes (default: number of available GPUs)",
 )
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Random seed for reproducible generation. If not specified, uses random seed for each generation.",
+)
 args = parser.parse_args()
 
 
@@ -246,6 +252,7 @@ sway_sampling_coef = args.sway_sampling_coef or config.get("sway_sampling_coef",
 speed = args.speed or config.get("speed", speed)
 fix_duration = args.fix_duration or config.get("fix_duration", fix_duration)
 device = args.device or config.get("device", device)
+seed = args.seed if args.seed is not None else config.get("seed", None)
 
 
 # patches for pip pkg user
@@ -338,10 +345,14 @@ def worker_process(worker_id, tasks_chunk, config):
         ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
     
     ema_model = load_model(
-        model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=process_device
+        model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=process_device, use_ema=False
     )
     
     print(f"[进程 {worker_id} {device_str}] 模型加载完成，开始处理 {len(tasks_chunk)} 个任务")
+    
+    seed = config.get("seed")
+    if seed is not None:
+        print(f"[进程 {worker_id}] 将使用固定随机种子: {seed}")
     
     # 循环处理分配给自己的任务
     base_output_dir = config["base_output_dir"]
@@ -381,9 +392,9 @@ def worker_process(worker_id, tasks_chunk, config):
             with open(lab_output_path, "w", encoding="utf-8") as f:
                 f.write(cleaned_text)
 
-            # 为每次推理生成随机 seed
-            seed = random.randint(0, 2**31 - 1)
-            seed_everything(seed)
+            # 如果指定了 seed，使用固定种子（可复现）；否则每次随机
+            task_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+            seed_everything(task_seed)
             
             # 禁用 infer_process 内部的进度条和输出
             audio_segment, final_sample_rate, spectrogram = infer_process(
@@ -409,6 +420,7 @@ def worker_process(worker_id, tasks_chunk, config):
             sf.write(str(individual_wave_path), audio_segment, final_sample_rate)
             if remove_silence:
                 remove_silence_for_generated_wav(str(individual_wave_path))
+
             
             # 验证文件是否成功创建
             if not individual_wave_path.exists():
@@ -496,6 +508,7 @@ def main():
         "ref_text": ref_text,
         "remove_silence": remove_silence,
         "model_cfg_path": model_cfg_path,
+        "seed": seed,
     }
     
     # 将任务列表切成 num_workers 份

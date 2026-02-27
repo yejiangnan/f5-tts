@@ -274,6 +274,7 @@ def load_model(
     ).to(device)
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
+    # model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
 
     return model
@@ -487,7 +488,6 @@ def infer_batch_process(
         )
 
 
-
         ref_audio_len = audio.shape[-1] // hop_length
         if fix_duration is not None:
             duration = int(fix_duration * target_sample_rate / hop_length)
@@ -496,10 +496,26 @@ def infer_batch_process(
             ref_text_len = len(ref_text.encode("utf-8"))
             gen_text_len = len(gen_text.encode("utf-8"))
             duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len / local_speed)
+        
+
+        print(f"audio.shape: {audio.shape}")
+        print(f"infer_text_list: {final_text_list}")
+        print(f"emphasis_ids_list: {emphasis_ids_list}")
+        print(f"duration: {duration}")
 
         # inference
         with torch.inference_mode():
-            generated, _ = model_obj.sample(
+        #     generated, _ = model_obj.sample(
+        #         cond=audio,
+        #         text=final_text_list,
+        #         duration=duration,
+        #         steps=nfe_step,
+        #         cfg_strength=cfg_strength,
+        #         sway_sampling_coef=sway_sampling_coef,
+        #         emphasis_ids=emphasis_ids_list,
+        #     )
+
+            generated, _, _, _, _ = model_obj.sample_with_logprob(
                 cond=audio,
                 text=final_text_list,
                 duration=duration,
@@ -508,10 +524,25 @@ def infer_batch_process(
                 sway_sampling_coef=sway_sampling_coef,
                 emphasis_ids=emphasis_ids_list,
             )
+
             del _
 
             generated = generated.to(torch.float32)  # generated mel spectrogram
             generated = generated[:, ref_audio_len:, :]
+
+            # 用模型内部 cond 的实际帧数切片，避免 ref_audio_len 与 mel 帧数不一致或 ref 过长导致空切片
+            # cond_mel = model_obj.mel_spec(audio)
+            # cond_frames = cond_mel.shape[2] if cond_mel.ndim == 3 else cond_mel.shape[-1]
+            # total_frames = generated.shape[1]
+            # gen_start = min(cond_frames, total_frames)
+            # generated = generated[:, gen_start:, :]
+            # if generated.shape[1] == 0:
+            #     import warnings
+            #     warnings.warn(
+            #         f"sample_with_logprob: 生成段长度为 0（cond_frames={cond_frames}, total_frames={total_frames}），请检查 ref 长度或 duration。"
+            #     )
+
+
             generated = generated.permute(0, 2, 1)
             if mel_spec_type == "vocos":
                 generated_wave = vocoder.decode(generated)

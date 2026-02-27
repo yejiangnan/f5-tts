@@ -179,6 +179,31 @@ PROMPT_NUMBER="""你是一个专业的、不会犯错的文本修改大师，请
 {input_text}
 """
 
+PROMPT_FOR_GRPO="""
+# Role
+你是一个精密的语音语调分析师，擅长识别文本中最核心的单一语义重音。
+
+# Task
+请在给定的每条文本中，找出【一个】最需要重读的词，并进行标注。
+
+# Rules (严格遵守)
+1. **唯一性**：每条文本【只能标注一个词】。
+2. **词性限制**：该词必须是【名词】或【虚词】（如介词、连词、助词、副词等）。
+3. **长度限制**：该词必须是【两个字及以下】。
+4. **标注格式**：使用 <strong>词汇</strong> 标签。
+5. **选择标准**：优先选择对全句逻辑贡献最大、感情色彩最浓或最能体现语意的词。
+6. **词性标注**：每个词的词性必须标注清楚，</strong>标签后用[词性]标注。
+7. 只输出标记后的文本本身，不要加任何标记、解释或说明
+
+# Example
+输入：我们必须在截止日期前完成任务。
+输出：我们必须在<strong>截止日期</strong>[名词]前完成任务。
+
+# Input
+请对以下文本进行标注：
+{input_text}
+"""
+
 
 def request_LLM_for_expansion(model_name, client, input_text, use_gpt4o=False, max_retries=8, initial_delay=2, prompt_type="emphasis", is_batch=False):
     """调用LLM API获取扩展后的响应
@@ -191,7 +216,8 @@ def request_LLM_for_expansion(model_name, client, input_text, use_gpt4o=False, m
         # 批量处理模式：构建批量 prompt
         if prompt_type == "emphasis":
             batch_input = "\n".join([f"===文本{i+1}===\n{text}" for i, text in enumerate(input_text)])
-            prompt = PROMPT_EMPHASIS_BATCH.format(input_text=batch_input)
+            # prompt = PROMPT_EMPHASIS_BATCH.format(input_text=batch_input)
+            prompt = PROMPT_FOR_GRPO.format(input_text=batch_input)
         else:
             # 其他类型暂不支持批量
             raise ValueError(f"批量处理暂不支持 prompt_type={prompt_type}")
@@ -255,27 +281,70 @@ def process_request(args, line:str):
     )
     
     if request_result is not None:
-        # 如果 prompt_type 是 emphasis，将多个词拆分成多个结果项
+        # 如果 prompt_type 是 emphasis，解析标注文本并提取重读词和词性
         if args.prompt_type == "emphasis":
-            # 按行分割，过滤空行和"无"
-            emphasis_words = [
-                word.strip() 
-                for word in request_result.split('\n') 
-                if word.strip() and word.strip() != "无"
-            ]
+            import re
+            # 匹配 <strong>词</strong>[词性] 格式
+            pattern = r'<strong>(.*?)</strong>\[(.*?)\]'
+            matches = re.findall(pattern, request_result)
+            
+            if matches:
+                # 找到匹配，提取词和词性
+                result_list = []
+                for word, pos_tag in matches:
+                    word = word.strip()
+                    pos_tag = pos_tag.strip()
+                    if word:
+                        # 生成 annotated_text：保留 <strong> 标签，但去掉 [词性]
+                        annotated_text = re.sub(
+                            r'<strong>(.*?)</strong>\[.*?\]',
+                            r'<strong>\1</strong>',
+                            request_result
+                        )
+                        result_item = {
+                            "input_text": annotated_text,
+                            "text": word,
+                        }
+                        if pos_tag:
+                            result_item["pos_tag"] = pos_tag
+                        result_list.append(result_item)
+                
+                if result_list:
+                    return True, result_list
+            else:
+                # 如果没有找到 [词性]，尝试只提取 <strong> 标签内的词
+                strong_pattern = r'<strong>(.*?)</strong>'
+                matches = re.findall(strong_pattern, request_result)
+                if matches:
+                    result_list = []
+                    for word in matches:
+                        word = word.strip()
+                        if word:
+                            result_item = {
+                                "input_text": request_result,  # 保留原始标注文本
+                                "text": word,
+                            }
+                            result_list.append(result_item)
+                    if result_list:
+                        return True, result_list
+                else:
+                    # 如果没有 <strong> 标签，按行分割（兼容旧格式）
+                    emphasis_words = [
+                        word.strip() 
+                        for word in request_result.split('\n') 
+                        if word.strip() and word.strip() != "无"
+                    ]
+                    if emphasis_words:
+                        return True, [
+                            {
+                                "input_text": input_text,
+                                "text": word,
+                            }
+                            for word in emphasis_words
+                        ]
             
             # 如果没有找到重读词，跳过（返回特殊标记）
-            if not emphasis_words:
-                return "skip", None  # 跳过，不输出任何结果
-            
-            # 返回多个结果项的列表
-            return True, [
-                {
-                    "input_text": input_text,
-                    "text": word,
-                }
-                for word in emphasis_words
-            ]
+            return "skip", None  # 跳过，不输出任何结果
         else:
             # 其他 prompt_type 保持原样
             sample = {
@@ -292,26 +361,68 @@ def parse_batch_result(batch_result, num_texts):
     """解析批量处理的结果
     
     Returns:
-        list: 每个元素是重读词列表（可能为空表示跳过）
+        list: 每个元素是 (annotated_text, word, pos_tag) 的列表
+            - annotated_text: 包含 <strong> 标签但不包含 [词性] 的文本
+            - word: 重读词
+            - pos_tag: 词性（如 "名词"、"动词" 等）
     """
+    import re
     results = []
     if not batch_result:
         return [[] for _ in range(num_texts)]
     
+
     # 按 "===文本N===" 分割结果
     parts = batch_result.split("===文本")
     for i in range(1, len(parts)):  # 跳过第一个空部分
         part = parts[i]
+        print(f"[part] {part}")
         # 提取文本序号和内容
         if "===" in part:
             content = part.split("===", 1)[1].strip()
-            # 提取重读词（按行分割，过滤空行和"无"）
-            emphasis_words = [
-                word.strip() 
-                for word in content.split('\n') 
-                if word.strip() and word.strip() != "无"
-            ]
-            results.append(emphasis_words)
+            
+            # 匹配 <strong>词</strong>[词性] 格式
+            # 例如: <strong>培养</strong>[名词]
+            pattern = r'<strong>(.*?)</strong>\[(.*?)\]'
+            matches = re.findall(pattern, content)
+            
+            if matches:
+                # 找到匹配，提取词和词性
+                emphasis_items = []
+                for word, pos_tag in matches:
+                    word = word.strip()
+                    pos_tag = pos_tag.strip()
+                    if word:
+                        # 生成 annotated_text：保留 <strong> 标签，但去掉 [词性]
+                        annotated_text = re.sub(
+                            r'<strong>(.*?)</strong>\[.*?\]',
+                            r'<strong>\1</strong>',
+                            content
+                        )
+                        emphasis_items.append((annotated_text, word, pos_tag))
+                results.append(emphasis_items)
+            else:
+                strong_pattern = r'<strong>(.*?)</strong>'
+                matches = re.findall(strong_pattern, content)
+                if matches:
+                    emphasis_items = []
+                    for word in matches:
+                        word = word.strip()
+                        if word:
+                            # 保留 <strong> 标签，词性设为空字符串
+                            annotated_text = content
+                            emphasis_items.append((annotated_text, word, ""))
+                    results.append(emphasis_items)
+                else:
+                    # 如果没有 <strong> 标签，按行分割（兼容旧格式）
+                    emphasis_words = [
+                        word.strip() 
+                        for word in content.split('\n') 
+                        if word.strip() and word.strip() != "无"
+                    ]
+                    # 旧格式：只有词，没有标注文本和词性
+                    emphasis_items = [("", word, "") for word in emphasis_words]
+                    results.append(emphasis_items)
         else:
             # 格式异常，添加空列表
             results.append([])
@@ -378,20 +489,25 @@ def process_batch_request(args, lines: list):
             batch_results = parse_batch_result(request_result, len(batch_texts))
             
             # 为每条文本生成结果
-            for (line, input_text), emphasis_words in zip(batch_original_lines, batch_results):
+            for (line, original_input_text), emphasis_items in zip(batch_original_lines, batch_results):
                 if args.prompt_type == "emphasis":
-                    if not emphasis_words:
+                    if not emphasis_items:
                         # 跳过没有重读词的文本
                         results.append(("skip", None))
                     else:
                         # 返回多个结果项的列表
-                        results.append((True, [
-                            {
-                                "input_text": input_text,
+                        # emphasis_items 是 (annotated_text, word, pos_tag) 的列表
+                        result_list = []
+                        for annotated_text, word, pos_tag in emphasis_items:
+                            result_item = {
+                                "input_text": annotated_text if annotated_text else original_input_text,
                                 "text": word,
                             }
-                            for word in emphasis_words
-                        ]))
+                            # 如果有词性，添加到结果中
+                            if pos_tag:
+                                result_item["pos_tag"] = pos_tag
+                            result_list.append(result_item)
+                        results.append((True, result_list))
                 else:
                     # 其他类型暂不支持批量
                     results.append((False, {

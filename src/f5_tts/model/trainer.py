@@ -4,12 +4,13 @@ import copy
 import gc
 import math
 import os
+from datetime import timedelta
 
 import torch
 import torchaudio
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
@@ -48,6 +49,7 @@ class Trainer:
         log_samples: bool = False,
         last_per_updates=None,
         accelerate_kwargs: dict = dict(),
+        accelerator=None,  # 多机训练时可由外部传入，避免重复初始化
         ema_kwargs: dict = dict(),
         bnb_optimizer: bool = False,
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
@@ -55,18 +57,22 @@ class Trainer:
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=3600))
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         self.log_samples = log_samples
 
-        self.accelerator = Accelerator(
-            log_with=logger if logger == "wandb" else None,
-            kwargs_handlers=[ddp_kwargs],
-            gradient_accumulation_steps=grad_accumulation_steps,
-            **accelerate_kwargs,
-        )
+        if accelerator is not None:
+            self.accelerator = accelerator
+        else:
+            self.accelerator = Accelerator(
+                log_with=logger if logger == "wandb" else None,
+                kwargs_handlers=[ddp_kwargs, init_kwargs],
+                gradient_accumulation_steps=grad_accumulation_steps,
+                **accelerate_kwargs,
+            )
 
         self.logger = logger
         if self.logger == "wandb":
@@ -97,7 +103,7 @@ class Trainer:
         elif self.logger == "tensorboard":
             from torch.utils.tensorboard import SummaryWriter
 
-            self.writer = SummaryWriter(log_dir=f"runs/{wandb_run_name}")
+            self.writer = SummaryWriter(log_dir=f"runs/{wandb_run_name}") if self.accelerator.is_main_process else None
 
         self.model = model
 
@@ -186,6 +192,8 @@ class Trainer:
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
         ):
+            if self.is_main:
+                print(f"⚠️  未找到 checkpoint 目录或文件: {self.checkpoint_path}")
             return 0
 
         self.accelerator.wait_for_everyone()
@@ -208,7 +216,13 @@ class Trainer:
                 )[-1]
             else:
                 # If no training checkpoints, use pretrained model
-                latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
+                if all_checkpoints:
+                    latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
+                else:
+                    if self.is_main:
+                        print(f"⚠️  checkpoint 目录中没有找到可用的 checkpoint 文件: {self.checkpoint_path}")
+                    return 0
+        
 
         if latest_checkpoint.endswith(".safetensors"):  # always a pretrained checkpoint
             from safetensors.torch import load_file
@@ -247,21 +261,42 @@ class Trainer:
             current_model = self.accelerator.unwrap_model(self.model)
             current_state_dict = current_model.state_dict()
             
+            # 统计加载情况
+            total_keys = len(model_state_dict)
+            matched_keys = 0
+            shape_mismatch_keys = []
+            missing_keys = []
+            
             for key in list(model_state_dict.keys()):
                 if key in current_state_dict:
                     if model_state_dict[key].shape != current_state_dict[key].shape:
+                        shape_mismatch_keys.append(key)
                         if "text_embed.weight" in key and len(model_state_dict[key].shape) == 2:
                             # Handle vocab size mismatch: only load matching part
                             if model_state_dict[key].shape[0] > current_state_dict[key].shape[0]:
                                 model_state_dict[key] = model_state_dict[key][:current_state_dict[key].shape[0]]
+                                matched_keys += 1
                             else:
                                 # Skip if checkpoint size < model size
                                 del model_state_dict[key]
                         else:
                             # Skip other size mismatches
                             del model_state_dict[key]
+                    else:
+                        matched_keys += 1
+                else:
+                    missing_keys.append(key)
+                    del model_state_dict[key]
             
-            current_model.load_state_dict(model_state_dict, strict=False)
+            # 加载权重
+            load_result = current_model.load_state_dict(model_state_dict, strict=False)
+            
+            if self.is_main:
+                print(f"✅ 加载 checkpoint: {latest_checkpoint} (update={checkpoint.get('update', 'N/A')})")
+                print(f"   成功加载: {matched_keys}/{total_keys} 参数")
+                if len(load_result.missing_keys) > 0 or len(shape_mismatch_keys) > 0:
+                    print(f"   警告: {len(load_result.missing_keys)} 个参数未加载, {len(shape_mismatch_keys)} 个形状不匹配")
+            
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -277,21 +312,42 @@ class Trainer:
             current_model = self.accelerator.unwrap_model(self.model)
             current_state_dict = current_model.state_dict()
             
+            # 统计加载情况
+            total_keys = len(model_state_dict)
+            matched_keys = 0
+            shape_mismatch_keys = []
+            missing_keys = []
+            
             for key in list(model_state_dict.keys()):
                 if key in current_state_dict:
                     if model_state_dict[key].shape != current_state_dict[key].shape:
+                        shape_mismatch_keys.append(key)
                         if "text_embed.weight" in key and len(model_state_dict[key].shape) == 2:
                             # Handle vocab size mismatch: only load matching part
                             if model_state_dict[key].shape[0] > current_state_dict[key].shape[0]:
                                 model_state_dict[key] = model_state_dict[key][:current_state_dict[key].shape[0]]
+                                matched_keys += 1
                             else:
                                 # Skip if checkpoint size < model size
                                 del model_state_dict[key]
                         else:
                             # Skip other size mismatches
                             del model_state_dict[key]
+                    else:
+                        matched_keys += 1
+                else:
+                    missing_keys.append(key)
+                    del model_state_dict[key]
             
-            current_model.load_state_dict(model_state_dict, strict=False)
+            # 加载权重
+            load_result = current_model.load_state_dict(model_state_dict, strict=False)
+            
+            if self.is_main:
+                print(f"✅ 加载预训练模型: {latest_checkpoint}")
+                print(f"   成功加载: {matched_keys}/{total_keys} 参数")
+                if len(load_result.missing_keys) > 0 or len(shape_mismatch_keys) > 0:
+                    print(f"   警告: {len(load_result.missing_keys)} 个参数未加载, {len(shape_mismatch_keys)} 个形状不匹配")
+            
             update = 0
 
         del checkpoint
@@ -406,7 +462,7 @@ class Trainer:
                     emphasis_ids = batch["emphasis_ids"]
 
                     # TODO. add duration predictor training
-                    if self.duration_predictor is not None and self.accelerator.is_local_main_process:
+                    if self.duration_predictor is not None and self.is_main:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
                     
@@ -515,9 +571,6 @@ class DPOTrainer(Trainer):
         for param in self.ref_model.parameters():
             param.requires_grad = False
         self.ref_model.eval()
-    
-
-  
     
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:

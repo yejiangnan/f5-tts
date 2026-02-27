@@ -265,6 +265,88 @@ class DPODataset(Dataset):
         return result
 
 
+class GRPODataset(Dataset):
+    def __init__(
+        self,
+        data_path: str,
+        target_sample_rate=24_000,
+        hop_length=256,
+        n_mel_channels=100,
+        n_fft=1024,
+        win_length=1024,
+        mel_spec_type="vocos",
+        mel_spec_module: nn.Module | None = None,
+    ):
+        super().__init__()
+        self.data = []
+        if isinstance(data_path, list):
+            for path in data_path:
+                with open(path, "r") as f:
+                    self.data.extend(json.load(f))
+        else:
+            with open(data_path, "r") as f:
+                self.data = json.load(f)
+
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.mel_spec_type = mel_spec_type
+
+        self.mel_spectrogram = default(
+            mel_spec_module,
+            MelSpec(
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                n_mel_channels=n_mel_channels,
+                target_sample_rate=target_sample_rate,
+                mel_spec_type=mel_spec_type,
+            ),
+        )
+
+        self.prompt_mel = []
+        self.prompt_duration = []
+        self.prompt_text = []
+        for prompt, text in self.data["prompts"]:
+            try:
+                prompt_audio, prompt_sr = torchaudio.load(prompt)
+                if prompt_audio.shape[0] > 1:
+                    prompt_audio = torch.mean(prompt_audio, dim=0, keepdim=True)
+                if prompt_sr != self.target_sample_rate:
+                    resampler = torchaudio.transforms.Resample(prompt_sr, self.target_sample_rate)
+                    prompt_audio = resampler(prompt_audio)
+                prompt_duration = prompt_audio.shape[-1] / self.target_sample_rate
+                prompt_mel = self.mel_spectrogram(prompt_audio)
+                prompt_mel = prompt_mel.squeeze(0)  # (1, d, n) -> (d, n)
+            except Exception as e:
+                continue
+            self.prompt_mel.append(prompt_mel)
+            self.prompt_duration.append(prompt_duration)
+            self.prompt_text.append(text)
+
+        self.prompt_len = len(self.prompt_mel)
+    
+    def __len__(self):
+        return len(self.data["texts"])
+    
+    def __getitem__(self, index):
+        text = self.data["texts"][index]
+        text_list, emphasis_ids_list = convert_char_to_pinyin([text], return_emphasis_ids=True)
+        text = text_list[0]
+        emphasis_ids = emphasis_ids_list[0]
+        prompt_mel = self.prompt_mel[index % self.prompt_len]
+        prompt_duration = self.prompt_duration[index % self.prompt_len]
+        prompt_text = self.prompt_text[index % self.prompt_len]
+
+        result = {
+            "ref_mel": prompt_mel,
+            "ref_duration": prompt_duration,
+            "ref_text": prompt_text,
+            "text": text,
+            "emphasis_ids": emphasis_ids
+        }
+        return result
 
 
 
@@ -295,7 +377,6 @@ class DynamicBatchSampler(Sampler[list[int]]):
         ):
             indices.append((idx, data_source.get_frame_len(idx)))
         indices.sort(key=lambda elem: elem[1])
-
         batch = []
         batch_frames = 0
         for idx, frame_len in tqdm(
@@ -608,6 +689,47 @@ def dpo_collate_fn(batch):
         emphasis_ids = [item["emphasis_ids"] for item in batch]
         result["emphasis_ids"] = emphasis_ids
     
+    return result
+
+
+def grpo_collate_fn(batch):
+    """Collate function for GRPO dataset.
+
+    Handles batching of ref mel spectrograms, ref_text, text, and emphasis_ids.
+    GRPODataset returns: {"ref_mel", "ref_duration", "ref_text", "text", "emphasis_ids"}
+    """
+    # Extract ref mel specs (dataset 返回 ref_mel)
+    ref_mel_specs = []
+    for item in batch:
+        spec = item["ref_mel"]
+        if spec.dim() == 3:
+            spec = spec.squeeze(0)  # (1, d, n) -> (d, n)
+        ref_mel_specs.append(spec)
+
+    mel_lengths = torch.LongTensor([spec.shape[-1] for spec in ref_mel_specs])
+    max_mel_length = mel_lengths.amax()
+
+    padded_mel_specs = []
+    for spec in ref_mel_specs:
+        padding = (0, max_mel_length - spec.size(-1))
+        padded_spec = F.pad(spec, padding, value=0)
+        padded_mel_specs.append(padded_spec)
+    mel_specs = torch.stack(padded_mel_specs)  # (b, d, n)
+
+    text = [item["text"] for item in batch]
+    text_lengths = torch.LongTensor([len(item) for item in text])
+
+    result = dict(
+        mel=mel_specs,
+        mel_lengths=mel_lengths,
+        text=text,
+        text_lengths=text_lengths,
+        ref_text=[item["ref_text"] for item in batch],
+    )
+
+    if "emphasis_ids" in batch[0]:
+        result["emphasis_ids"] = [item["emphasis_ids"] for item in batch]
+
     return result
 
 

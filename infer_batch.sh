@@ -2,15 +2,15 @@
 
 
 
-python src/f5_tts/infer/infer_batch.py \
-    --model F5TTS_v1_Base \
-    --ckpt_file /data/F5-TTS/ckpts/sft_data_dpo_2/model_15000.pt \
-    --vocab_file data/sft_data_pinyin/vocab.txt \
-    --ref_audio "/data/F5-TTS/prompts/stepf06.wav" \
-    --ref_text "真的，我常想，要是当年有人能在我大一的时候<strong>亲自</strong>告诉我这些事就好了。" \
-    --gen_file /data/F5-TTS/text_file/emphasis_text_format_batch6_f06.txt \
-    --base_output_dir /data/F5-TTS/stepf06_data/batch_1/wavs \
-    --count 20
+# python src/f5_tts/infer/infer_batch.py \
+#     --model F5TTS_v1_Base \
+#     --ckpt_file /data/F5-TTS/ckpts/sft_data_dpo_2/model_15000.pt \
+#     --vocab_file data/sft_data_pinyin/vocab.txt \
+#     --ref_audio "/data/F5-TTS/prompts/stepf06.wav" \
+#     --ref_text "真的，我常想，要是当年有人能在我大一的时候<strong>亲自</strong>告诉我这些事就好了。" \
+#     --gen_file /data/F5-TTS/text_file/emphasis_text_format_batch6_f06.txt \
+#     --base_output_dir /data/F5-TTS/stepf06_data/batch_1/wavs \
+#     --count 20
 
 # python src/f5_tts/infer/infer_batch.py \
 #     --model F5TTS_v1_Base \
@@ -21,3 +21,14 @@ python src/f5_tts/infer/infer_batch.py \
 #     --gen_file /data/F5-TTS/text_file/emphasis_text_format_batch7_f15.txt \
 #     --base_output_dir /data/F5-TTS/stepf15_data/batch_1/wavs \
 #     --count 20
+
+python src/f5_tts/infer/infer_batch.py \
+    --model F5TTS_v1_Base \
+    --ckpt_file /data/F5-TTS/ckpts/sft_data_dpo_1/model_13000.pt \
+    --vocab_file data/sft_data_pinyin/vocab.txt \
+    --ref_audio "/data/F5-TTS/grpo_rewards/wavs_2/001188.wav" \
+    --ref_text "基于这两点分析，他认为凯瑟琳并非被击打致死，而是意外跌落事故。因此推断为意外事件。" \
+    --gen_file /data/F5-TTS/test.txt \
+    --base_output_dir /data/F5-TTS/paper_eval/dpo/wavs \
+    --seed 92129 \
+    --count 1

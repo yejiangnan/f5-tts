@@ -7,12 +7,26 @@ ckpts/
 wandb/
 results/
 
+# 大文件 / checkpoint 备份（避免 git add 卡顿）
+presersed_ckpts.zip
+preserved_ckpts/
+*.zip
+
+# 临时测试输出
+test*.txt
+
 # 不上传以下文件夹
 text_file/
 stepf15_data/
 stepf06_data/
 outputs/
 gen_test/
+grpo_data/
+grpo_rewards/
+text_file/
+tests/
+paper_eval/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

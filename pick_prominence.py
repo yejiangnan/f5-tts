@@ -309,7 +309,8 @@ def pick_prominence(proc_dir, json_output, raw_text):
     
 
 if __name__ == "__main__":
-    proc_dir = "stepf06_data/batch_1"
+    proc_dir = "/data/datasets/emphasis_data/arknights_zh"
+    # proc_dir = "stepf06_data/batch_1"
     raw_text = "/data/F5-TTS/text_file/emphasis_text_format_batch6_f06.txt"
     # proc_dir = "stepf15_data/batch_1"
     # raw_text = "/data/F5-TTS/text_file/emphasis_text_format_batch7_f15.txt"
@@ -318,25 +319,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--wavs", 
-        default=f"/data/F5-TTS/{proc_dir}/wavs",
+        default=f"{proc_dir}/wavs",
         type=str, 
         required=False
     )
     parser.add_argument(
         "--annotation", 
-        default=f"/data/F5-TTS/{proc_dir}/aligned",
+        default=f"{proc_dir}/aligned",
         type=str, 
         required=False
     )
     parser.add_argument(
         "--json_output", 
-        default=f"/data/F5-TTS/{proc_dir}/prominence.json",
+        default=f"{proc_dir}/prominence.json",
         type=str, 
         required=False
     )
     parser.add_argument(
         "--wav_out_dir", 
-        default=f"/data/F5-TTS/{proc_dir}/emphasis_wavs",
+        default=f"{proc_dir}/emphasis_wavs",
         type=str, 
         required=False
     )
@@ -360,8 +361,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    # mfa(args.wavs, args.annotation, num_jobs=args.num_jobs, batch_size=args.batch_size)
+    mfa(args.wavs, args.annotation, num_jobs=args.num_jobs, batch_size=args.batch_size)
     # get_prominence(args.wavs, args.annotation, args.json_output, args.wav_out_dir, num_workers=args.num_workers)
-    pick_prominence(proc_dir, args.json_output, raw_text)
+    # pick_prominence(proc_dir, args.json_output, raw_text)
 
     

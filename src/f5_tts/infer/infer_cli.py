@@ -291,7 +291,7 @@ if not ckpt_file:
 
 print(f"Using {model}...")
 ema_model = load_model(
-    model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device
+    model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device, use_ema=False
 )
 
 
